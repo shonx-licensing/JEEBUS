@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
 import { insertStarterRecipes } from "@/lib/hyetas/insertStarterRecipes";
+import { parseIngredientsMd } from "@/lib/hyetas/ingredientLines";
 
 const MEAL_TYPES = ["breakfast", "lunch", "dinner", "snack", "side"] as const;
 const CONTAINS_TAGS = ["peanut", "avocado", "oats", "banana_cooked"] as const;
@@ -55,6 +56,55 @@ function readForm(formData: FormData) {
   };
 }
 
+
+/**
+ * Rebuild a recipe's grocery-list ingredient rows from its ingredient text.
+ * Keeps the aisle / pantry-staple / notes already set on an ingredient
+ * with the same name, so editing a recipe doesn't lose them.
+ */
+async function syncRecipeIngredients(
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  recipeId: string,
+  ingredientsMd: string | null,
+): Promise<string | null> {
+  const parsed = parseIngredientsMd(ingredientsMd);
+
+  const { data: old } = await supabase
+    .from("recipe_ingredients")
+    .select("name, aisle, is_pantry_staple, notes")
+    .eq("recipe_id", recipeId);
+  const keep = new Map<string, { aisle: string | null; is_pantry_staple: boolean; notes: string | null }>();
+  for (const o of (old as { name: string; aisle: string | null; is_pantry_staple: boolean; notes: string | null }[] | null) ?? []) {
+    keep.set(o.name.toLowerCase(), o);
+  }
+
+  const { error: delError } = await supabase
+    .from("recipe_ingredients")
+    .delete()
+    .eq("recipe_id", recipeId);
+  if (delError) return delError.message;
+  if (!parsed.length) return null;
+
+  const { error } = await supabase.from("recipe_ingredients").insert(
+    parsed.map((p) => {
+      const prev = keep.get(p.name.toLowerCase());
+      return {
+        recipe_id: recipeId,
+        name: p.name,
+        quantity: p.quantity,
+        qty_value: p.qty_value,
+        qty_unit: p.qty_unit,
+        is_optional: p.is_optional,
+        section: p.section,
+        aisle: prev?.aisle ?? "Other",
+        is_pantry_staple: prev?.is_pantry_staple ?? false,
+        notes: p.notes ?? prev?.notes ?? null,
+      };
+    }),
+  );
+  return error?.message ?? null;
+}
+
 export async function addRecipe(formData: FormData) {
   const data = readForm(formData);
   if (!data.name) redirect("/recipes/new?error=Name+is+required");
@@ -68,15 +118,24 @@ export async function addRecipe(formData: FormData) {
   const householdId = await getHouseholdId();
   if (!householdId) redirect("/recipes?error=Household+not+found");
 
-  const { error } = await supabase.from("recipes").insert({
-    household_id: householdId,
-    ...data,
-    is_cooked: true,
-    is_active: true,
-  });
+  const { data: inserted, error } = await supabase
+    .from("recipes")
+    .insert({
+      household_id: householdId,
+      ...data,
+      is_cooked: true,
+      is_active: true,
+    })
+    .select("id")
+    .single();
 
-  if (error)
-    redirect(`/recipes/new?error=${encodeURIComponent(error.message)}`);
+  if (error || !inserted)
+    redirect(`/recipes/new?error=${encodeURIComponent(error?.message ?? "Could not save recipe")}`);
+
+  // Also save each ingredient line for the grocery list.
+  const ingError = await syncRecipeIngredients(supabase, inserted.id as string, data.ingredients_md);
+  if (ingError)
+    redirect(`/recipes/${inserted.id}?error=${encodeURIComponent(ingError)}`);
 
   revalidatePath("/recipes");
   revalidatePath("/meals");
@@ -97,6 +156,12 @@ export async function updateRecipe(formData: FormData) {
   }
 
   const supabase = await createClient();
+  const { data: before } = await supabase
+    .from("recipes")
+    .select("ingredients_md")
+    .eq("id", id)
+    .single();
+
   const { error } = await supabase
     .from("recipes")
     .update(data)
@@ -104,6 +169,15 @@ export async function updateRecipe(formData: FormData) {
 
   if (error)
     redirect(`/recipes/${id}/edit?error=${encodeURIComponent(error.message)}`);
+
+  // Only rebuild the grocery-list ingredients when the ingredient text
+  // actually changed, so editing just the name or notes leaves them alone.
+  const oldMd = (before as { ingredients_md: string | null } | null)?.ingredients_md ?? null;
+  if ((oldMd ?? "").trim() !== (data.ingredients_md ?? "").trim()) {
+    const ingError = await syncRecipeIngredients(supabase, id, data.ingredients_md);
+    if (ingError)
+      redirect(`/recipes/${id}/edit?error=${encodeURIComponent(ingError)}`);
+  }
 
   revalidatePath("/recipes");
   revalidatePath(`/recipes/${id}`);

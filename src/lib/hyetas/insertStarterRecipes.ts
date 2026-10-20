@@ -8,6 +8,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { STARTER_RECIPES } from "@/lib/hyetas/starterPacks";
 import { starterStyle } from "@/lib/hyetas/starterStyleTags";
+import { parseQuantity } from "@/lib/hyetas/community";
 
 export async function insertStarterRecipes(
   householdId: string,
@@ -50,13 +51,20 @@ export async function insertStarterRecipes(
     const { error: ingError } = await supabase
       .from("recipe_ingredients")
       .insert(
-        r.ingredients.map((i) => ({
+        r.ingredients.map((i) => {
+          // Store the number + unit too ("500 g" → 500, "g") so the
+          // grocery list can add amounts up, not just show the text.
+          const q = parseQuantity(i.quantity);
+          return {
           recipe_id: inserted!.id,
           name: i.name,
           quantity: i.quantity,
+          qty_value: q.value,
+          qty_unit: q.unit,
           aisle: i.aisle,
           is_pantry_staple: i.is_pantry_staple ?? false,
-        })),
+          };
+        }),
       );
     if (ingError) return ingError.message;
   }
